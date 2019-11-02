@@ -178,76 +178,108 @@ infoPrints hist_H hist_M hist_C = do
   emit $ Imp.DebugPrint "Multiplication degree (M)" $ Just $ Imp.vi32 hist_M
   emit $ Imp.DebugPrint "Cooperation level (C)" $ Just hist_C
 
-prepareIntermediateArraysGlobal :: Imp.Exp -> Imp.Exp -> [SegHistSlug]
+-- | Some kernel bodies are not safe (or efficient) to execute
+-- multiple times.
+data Passage = MustBeSinglePass | MayBeMultiPass deriving (Eq, Ord)
+
+bodyPassage :: KernelBody ExplicitMemory -> Passage
+bodyPassage kbody
+  | mempty == consumedInKernelBody (aliasAnalyseKernelBody kbody) =
+      MayBeMultiPass
+  | otherwise =
+      MustBeSinglePass
+
+prepareIntermediateArraysGlobal :: Passage -> Imp.Exp -> Imp.Exp -> [SegHistSlug]
                                 -> CallKernelGen
-                                   [[Imp.Exp] -> InKernelGen ()]
-prepareIntermediateArraysGlobal hist_T hist_N =
-  fmap snd . mapAccumLM onOp Nothing
+                                   (Imp.Exp,
+                                    [[Imp.Exp] -> InKernelGen ()])
+prepareIntermediateArraysGlobal passage hist_T hist_N slugs = do
+  -- The paper formulae assume there is only one histogram, but in our
+  -- implementation there can be multiple that have been horisontally
+  -- fused.  We do a bit of trickery with summings and averages to
+  -- pretend there is really only one.  For the case of a single
+  -- histogram, the actual calculations should be the same as in the
+  -- paper.
+
+  -- The sum of all Hs.
+  hist_H <- dPrimVE "hist_H" . sum =<< mapM (toExp . histWidth . slugOp) slugs
+
+  hist_RF <- dPrimVE "hist_RF" $
+    sum (map (r64 . toExp' int32 . histRaceFactor . slugOp) slugs)
+    / r64 (genericLength slugs)
+
+  hist_el_size <- dPrimVE "hist_el_size" $ sum $ map slugElSize slugs
+
+  hist_C_max <- dPrimVE "hist_C_max" $
+    Imp.BinOpExp (SMin Int32) hist_T $ hist_H `quot` hist_k_ct_min
+
+  hist_M_min <- dPrimVE "hist_M_min" $
+    Imp.BinOpExp (SMax Int32) 1 $ hist_T `quot` hist_C_max
+
+  hist_RACE_exp <- dPrimVE "hist_RACE_exp" $
+    Imp.BinOpExp (FMax Float64) 1 $
+    (hist_k_RF * hist_RF) /
+    Imp.BinOpExp (FMin Float64) 1 (hist_L2_ln_sz  / r64 hist_el_size)
+
+  hist_S <- dPrimVE "hist_S" $
+    case passage of
+      MayBeMultiPass ->
+        (hist_M_min * hist_H * hist_el_size) `quotRoundingUp`
+        t64 (hist_F_L2 * hist_L2 * hist_RACE_exp)
+      MustBeSinglePass ->
+        1
+
+  emit $ Imp.DebugPrint "Number of chunks (S)" $ Just hist_S
+
+  histograms <- snd <$> mapAccumLM (onOp hist_M_min hist_S hist_RACE_exp) Nothing slugs
+
+  return (hist_S, histograms)
   where
-    onOp l slug@(SegHistSlug op num_subhistos subhisto_info do_op) = do
+    hist_k_ct_min = 2
+    hist_k_RF = 0.75
+    hist_L2 = 5 * 1024 * 1024
+    hist_L2_ln_sz = FunExp "log2_64" [r64 hist_L2] $ FloatType Float64
+    hist_F_L2 = 0.4
+
+    r64 = ConvOpExp (SIToFP Int32 Float64)
+    t64 = ConvOpExp (FPToSI Float64 Int32)
+
+    -- "Average element size" as computed by a formula that also takes
+    -- locking into account.
+    slugElSize (SegHistSlug op _ _ do_op) =
+      case do_op of
+        AtomicLocking{} ->
+          unCount
+          (sum $ map (typeSize . (`arrayOfShape` histShape op)) $
+           Prim int32 : lambdaReturnType (histOp op))
+          `quot` genericLength (lambdaReturnType (histOp op))
+        _ ->
+          unCount $ sum $
+          map (typeSize . (`arrayOfShape` histShape op)) $
+          lambdaReturnType (histOp op)
+
+    onOp hist_M_min hist_S hist_RACE_exp l slug = do
+      let SegHistSlug op num_subhistos subhisto_info do_op = slug
       hist_H <- toExp $ histWidth op
+
+      hist_H_chk <- dPrimVE "hist_H_chk" $
+                    hist_H `quotRoundingUp` hist_S
+
+      emit $ Imp.DebugPrint "Chunk size (H_chk)" $ Just hist_H_chk
+
+      hist_k_max <- dPrimVE "hist_k_max" $
+        Imp.BinOpExp (SMin Int32)
+        (t64 (hist_F_L2 * hist_L2 * hist_RACE_exp) `quot` slugElSize slug) hist_N
+        `quotRoundingUp` hist_T
 
       hist_u <- dPrimVE "hist_u" $
                 case do_op of
                   AtomicPrim{} -> 1
                   _            -> 2
 
-      hist_RF <- toExp $ histRaceFactor op
-
-      let hist_k_RF = 0.75
-          hist_L2 = 16384
-          hist_L2_ln_sz = 64
-          hist_F_L2 = 0.4
-
-      let r64 = ConvOpExp (SIToFP Int32 Float64)
-          t64 = ConvOpExp (FPToSI Float64 Int32)
-
-      let hist_el_size =
-            case do_op of
-              AtomicLocking{} ->
-                unCount
-                (sum $ map (typeSize . (`arrayOfShape` histShape op)) $
-                 Prim int32 : lambdaReturnType (histOp op))
-                `quot` genericLength (lambdaReturnType (histOp op))
-              _ ->
-                unCount $ sum $
-                map (typeSize . (`arrayOfShape` histShape op)) $
-                lambdaReturnType (histOp op)
-
-      hist_RACE_exp <- dPrimVE "hist_RACE_exp" $
-        Imp.BinOpExp (FMax Float64) 1 $
-        (hist_k_RF * r64 hist_RF) /
-        Imp.BinOpExp (FMin Float64) 1 (r64 hist_L2_ln_sz  / r64 hist_el_size)
-
-      -- Hardcode a single pass for now.
-      let hist_S = 1
-
-      hist_H_chk <- dPrimVE "hist_H_chk" $
-                    hist_H `quotRoundingUp` hist_S
-
-
-      hist_k_max <- dPrimVE "hist_k_max" $
-        Imp.BinOpExp (SMin Int32)
-        (t64 (hist_F_L2 * hist_L2 * hist_RACE_exp)) hist_N
-        `quotRoundingUp` hist_T
-
       hist_C <- dPrimVE "hist_C" $
                 Imp.BinOpExp (SMin Int32) hist_T $
                 (hist_u * hist_H_chk) `quotRoundingUp` hist_k_max
-
-      -- Minimal sequential chunking factor.
-      let q_small = 2
-      work_asymp_M_max <- dPrimVE "work_asymp_M_max" $
-                          hist_N `quot` (q_small * hist_H)
-
-      let glb_k_min = 2
-      coop_min <- dPrimVE "coop_min" $
-                  Imp.BinOpExp (SMin Int32) hist_T $ hist_H `quot` glb_k_min
-
-      hist_M_min <- dPrimVE "hist_M_min" $
-                    Imp.BinOpExp (SMax Int32) 1 $
-                    Imp.BinOpExp (SMin Int32) work_asymp_M_max $
-                    hist_T `quot` coop_min
 
       -- Number of subhistograms per result histogram.
       hist_M <- dPrimV "hist_M" $
@@ -284,27 +316,27 @@ prepareIntermediateArraysGlobal hist_T hist_N =
 
       return (l', do_op')
 
-histKernelGlobal :: [PatElem ExplicitMemory]
-                 -> Count NumGroups SubExp -> Count GroupSize SubExp
-                 -> SegSpace
-                 -> [SegHistSlug]
-                 -> KernelBody ExplicitMemory
-                 -> CallKernelGen ()
-histKernelGlobal map_pes num_groups group_size space slugs kbody = do
-  num_groups' <- traverse toExp num_groups
-  group_size' <- traverse toExp group_size
+histKernelGlobalPass :: [PatElem ExplicitMemory]
+                     -> Count NumGroups Imp.Exp
+                     -> Count GroupSize Imp.Exp
+                     -> SegSpace
+                     -> [SegHistSlug]
+                     -> KernelBody ExplicitMemory
+                     -> [[Imp.Exp] -> ImpM ExplicitMemory Imp.KernelOp ()]
+                     -> Imp.Exp
+                     -> Imp.Exp
+                     -> ImpM ExplicitMemory Imp.HostOp ()
+histKernelGlobalPass map_pes num_groups group_size space slugs kbody histograms hist_S chk_i = do
+
   let (space_is, space_sizes) = unzip $ unSegSpace space
       space_sizes_64 = map (i32Toi64 . toExp' int32) space_sizes
       total_w_64 = product space_sizes_64
-      num_threads = unCount num_groups' * unCount group_size'
 
-  emit $ Imp.DebugPrint "## Using global memory" Nothing
+  hist_H_chks <- forM (map (histWidth . slugOp) slugs) $ \w -> do
+    w' <- toExp w
+    dPrimVE "hist_H_chk" $ w' `quotRoundingUp` hist_S
 
-  histograms <-
-    prepareIntermediateArraysGlobal num_threads
-    (toExp' int32 $ last space_sizes) slugs
-
-  sKernelThread "seghist_global" num_groups' group_size' (segFlat space) $ \constants -> do
+  sKernelThread "seghist_global" num_groups group_size (segFlat space) $ \constants -> do
     -- Compute subhistogram index for each thread, per histogram.
     subhisto_inds <- forM slugs $ \slug ->
       dPrimVE "subhisto_ind" $
@@ -315,7 +347,8 @@ histKernelGlobal map_pes num_groups group_size space slugs kbody = do
     -- calculation is done with 64-bit integers to avoid overflow,
     -- but the final unflattened segment indexes are 32 bit.
     let gtid = i32Toi64 $ kernelGlobalThreadId constants
-    kernelLoop gtid (i32Toi64 num_threads) total_w_64 $ \offset -> do
+        num_threads = i32Toi64 $ kernelNumThreads constants
+    kernelLoop gtid num_threads total_w_64 $ \offset -> do
 
       -- Construct segment indices.
       let setIndex v e = do dPrim_ v int32
@@ -342,23 +375,49 @@ histKernelGlobal map_pes num_groups group_size space slugs kbody = do
             perOp = chunks $ map (length . histDest . slugOp) slugs
 
         sComment "perform atomic updates" $
-          forM_ (zip5 (map slugOp slugs) histograms buckets (perOp vs) subhisto_inds) $
+          forM_ (zip6 (map slugOp slugs) histograms buckets (perOp vs) subhisto_inds hist_H_chks) $
           \(HistOp dest_w _ _ _ shape lam,
-            do_op, bucket, vs', subhisto_ind) -> do
+            do_op, bucket, vs', subhisto_ind, hist_H_chk) -> do
 
-            let bucket' = toExp' int32 $ kernelResultSubExp bucket
+            let chk_beg = chk_i * hist_H_chk
+                bucket' = toExp' int32 $ kernelResultSubExp bucket
                 dest_w' = toExp' int32 dest_w
-                bucket_in_bounds = 0 .<=. bucket' .&&. bucket' .<. dest_w'
-                bucket_is = map Imp.vi32 (init space_is) ++
-                            [subhisto_ind, bucket']
+                bucket_in_bounds = chk_beg .<=. bucket' .&&.
+                                   bucket' .<. (chk_beg + hist_H_chk) .&&.
+                                   bucket' .<. dest_w'
                 vs_params = takeLast (length vs') $ lambdaParams lam
 
             sWhen bucket_in_bounds $ do
+              let bucket_is = map Imp.vi32 (init space_is) ++
+                              [subhisto_ind, bucket']
               dLParams $ lambdaParams lam
               sLoopNest shape $ \is -> do
                 forM_ (zip vs_params vs') $ \(p, res) ->
                   copyDWIM (paramName p) [] (kernelResultSubExp res) is
                 do_op (bucket_is ++ is)
+
+
+histKernelGlobal :: [PatElem ExplicitMemory]
+                 -> Count NumGroups SubExp -> Count GroupSize SubExp
+                 -> SegSpace
+                 -> [SegHistSlug]
+                 -> KernelBody ExplicitMemory
+                 -> CallKernelGen ()
+histKernelGlobal map_pes num_groups group_size space slugs kbody = do
+  num_groups' <- traverse toExp num_groups
+  group_size' <- traverse toExp group_size
+  let (_space_is, space_sizes) = unzip $ unSegSpace space
+      num_threads = unCount num_groups' * unCount group_size'
+
+  emit $ Imp.DebugPrint "## Using global memory" Nothing
+
+  (hist_S, histograms) <-
+    prepareIntermediateArraysGlobal (bodyPassage kbody)
+    num_threads (toExp' int32 $ last space_sizes) slugs
+
+  sFor "chk_i" hist_S $ \chk_i ->
+    histKernelGlobalPass map_pes num_groups' group_size' space slugs kbody
+    histograms hist_S chk_i
 
 prepareIntermediateArraysLocal :: VName
                                -> Count NumGroups SubExp
