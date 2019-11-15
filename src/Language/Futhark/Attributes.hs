@@ -40,6 +40,7 @@ module Language.Futhark.Attributes
   , aliases
   , diet
   , arrayRank
+  , arrayShape
   , nestedDims
   , orderZero
   , unfoldFunType
@@ -64,6 +65,7 @@ module Language.Futhark.Attributes
   , tupleRecord
   , isTupleRecord
   , areTupleFields
+  , tupleFields
   , tupleFieldNames
   , sortFields
   , sortConstrs
@@ -262,12 +264,17 @@ isTupleRecord :: TypeBase dim as -> Maybe [TypeBase dim as]
 isTupleRecord (Scalar (Record fs)) = areTupleFields fs
 isTupleRecord _ = Nothing
 
+-- | Does this record map correspond to a tuple?
 areTupleFields :: M.Map Name a -> Maybe [a]
 areTupleFields fs =
   let fs' = sortFields fs
   in if and $ zipWith (==) (map fst fs') tupleFieldNames
      then Just $ map snd fs'
      else Nothing
+
+-- | Construct a record map corresponding to a tuple.
+tupleFields :: [a] -> M.Map Name a
+tupleFields as = M.fromList $ zip tupleFieldNames as
 
 -- | Increasing field names for a tuple (starts at 1).
 tupleFieldNames :: [Name]

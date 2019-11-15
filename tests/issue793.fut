@@ -27,9 +27,10 @@ let sphereIntersect (rayO: [3]f32) (rayD: [3]f32) (s: Sphere): f32 =
         in if (0 < t) then t else DROP_OFF
 
 -- render function
-let render (dim: [2]i32)
-           (spheres: []Sphere)
-           (lights: []Sphere)
+let render [nspheres] [nlights]
+           (dim: [2]i32)
+           (spheres: [nspheres]Sphere)
+           (lights: [nlights]Sphere)
            : [][4]u8 = -- return a color for each pixel
     let pixIndices = iota (dim[0] * dim[1])
     in map (\i -> -- for each pixel
@@ -42,16 +43,16 @@ let render (dim: [2]i32)
                 (map (\sphere ->
                     sphereIntersect rayO rayD sphere
                 ) spheres)
-                (iota (length spheres))
-                (replicate (length spheres) P_SPHERE)
+                (iota nspheres)
+                (replicate nspheres P_SPHERE)
 
             -- light intersections
             let lInts: []Intersection = map3 (\t index prim -> {t, index, prim})
                 (map (\light ->
                     sphereIntersect rayO rayD light
                 ) lights)
-                (iota (length lights))
-                (replicate (length lights) P_LIGHT)
+                (iota nlights)
+                (replicate nlights P_LIGHT)
 
             -- closest intersection and corresponding primitive index
             let min: Intersection = reduce (\min x->

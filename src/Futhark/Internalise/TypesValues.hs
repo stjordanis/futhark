@@ -137,8 +137,7 @@ internaliseConstructors cs =
                 foldl' f (zip ts [0..], mempty, mempty) c_ts
           in (ts ++ new_ts, M.insert c (i, js) mapping)
           where f (ts', js, new_ts) t
-                  | primType t,
-                    Just (_, j) <- find ((==t) . fst) ts' =
+                  | Just (_, j) <- find ((==t) . fst) ts' =
                       (delete (t, j) ts',
                        js ++ [j],
                        new_ts)
